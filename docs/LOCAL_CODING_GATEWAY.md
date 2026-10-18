@@ -2,7 +2,7 @@
 
 This server provides Anthropic Messages and OpenAI Responses endpoints. It uses the current Notion Agent endpoints, rather than changing the original Chat Completions server. The verified workspace mapping is `albuquerque-quinn` → **Opus 5.5**.
 
-## Everyday use (already installed on this Mac)
+## Existing global model-picker installation
 
 From any directory, run one command:
 
@@ -18,12 +18,12 @@ Global configuration was backed up under `.local/integration-backups/`. Only Cla
 
 Each Claude Code or Codex conversation now keeps one Notion thread, including local tool calls and resumed conversations. Restarting `notion-proxy` preserves the binding. Starting a new client conversation creates a separate binding. Conversations from the old stateless gateway establish their binding once on the first request after this upgrade, importing the supplied client history; subsequent requests reuse it. Existing Notion chat records are left intact.
 
-## Development / fresh installation
+## Server development
 
 Requires Python 3.11 or newer and an installed Claude Code CLI.
 
 ```sh
-cd /Users/ticture/Documents/project/notion2api
+cd /path/to/notion2api
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python scripts/local_gateway.py
@@ -34,17 +34,20 @@ The gateway binds to `127.0.0.1:8765`. It creates `.local/gateway-key` with mode
 From the project you want to work on, run:
 
 ```sh
-/Users/ticture/Documents/project/notion2api/.venv/bin/python \
-  /Users/ticture/Documents/project/notion2api/scripts/claude_notion.py \
+/path/to/notion2api/.venv/bin/python \
+  /path/to/notion2api/scripts/claude_notion.py \
   --safe-mode --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
   --tools Read,Edit,Write,Bash,Glob,Grep
 ```
 
 The older `claude_notion.py` launcher remains available for isolated diagnostics. Everyday use no longer needs it. Normal local tool permission checks remain active. Supplied code, prompts, and tool results go to Notion, and Notion creates chat records. After provisioning the local session and model catalog, `scripts/install_model_picker.py` installs the global picker integration and the manual command.
 
-## Session file
+## Session file and profiles
 
-This installation was provisioned from the user's authorized, logged-in Notion browser session. `.local/notion-session.json` is ignored by Git and stored with mode 0600. It contains:
+Default settings live in `.local/`; named profiles use `.local/profiles/<name>/`. The server selects the profile through `notion-proxy --profile <name>`. Bindings are namespaced by Notion user and workspace. The original default database is migrated in place on first upgraded startup. Both CLI wrappers use process-local settings, while the global model-picker installer is an optional advanced path. See the README for prerequisites and workspace switching rules.
+
+
+For a fresh installation, follow the [README](../README.md) and import your own browser-copied request with `scripts/setup_gateway.py`. The importer verifies model access before saving a profile. `.local/notion-session.json` is ignored by Git and stored with mode 0600. It contains:
 
 ```json
 {
@@ -89,7 +92,7 @@ Use only your own session. Current deployments can also require session-binding 
 - Codex independently read a disposable Python project, edited `duration.py` with `apply_patch`, and executed `python3 -m unittest -v`; all three test methods passed. Tests and README remained unchanged.
 - Existing ChatGPT routing through the new router returned `ORIGINAL_CODEX_OK`.
 - The original DuckCode destination produced a TLS `UNEXPECTED_EOF_WHILE_READING` on direct inspection. Its configuration is preserved; live availability of that upstream was not established. Pass-through preservation is covered by stream/credential isolation tests.
-- Twenty-one protocol/routing/session boundary checks passed. Token/cost fields shown by clients remain estimates, not Notion billing data.
+- Protocol/routing/session/setup checks are in `checks/`; run the command below for the current result. Token/cost fields shown by clients remain estimates, not Notion billing data.
 - Persistent-session acceptance: one real Claude Code conversation made eight model requests across five CLI invocations, including a gateway process restart, `Read`, `Read`, `Edit`, and `Bash`. All eight reused one Notion thread; the client recalled the first-turn marker, modified a disposable Python file, and passed its unchanged test.
 - A real Codex conversation resumed with the same Notion thread and recalled its first-turn marker. Two transient upstream transport failures required client retries; the remote transcript had exactly two user messages and two completed turns, confirming retries did not duplicate the continuation.
 

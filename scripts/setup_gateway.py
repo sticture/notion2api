@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--check", action="store_true", help="Verify stored login and Opus 5.5 access without creating a chat")
     parser.add_argument("--list-profiles", action="store_true")
     parser.add_argument("--install-commands", action="store_true", help="Install manual launchers; no global client setting changes or autostart")
+    parser.add_argument("--bin-dir", type=Path, default=Path.home() / ".local/bin", help="Launcher directory (default: ~/.local/bin)")
     args = parser.parse_args()
     try:
         folder = profile_path(args.profile)
@@ -42,7 +43,7 @@ def main():
             raise ValueError("On Windows run the Python launchers directly; command installation is macOS/Linux only")
         session = folder / "notion-session.json"
         if args.from_curl:
-            config = parse_curl(args.from_curl.read_text())
+            config = parse_curl(args.from_curl.read_text(encoding="utf-8"))
             folder.mkdir(parents=True, exist_ok=True, mode=0o700)
             fd, tmp = tempfile.mkstemp(dir=folder, prefix=".verify-")
             try:
@@ -64,8 +65,8 @@ def main():
             parser.print_help()
             return
         if args.install_commands:
-            install_commands(ROOT, Path.home() / ".local/bin")
-            print("Installed: notion-proxy, claude-notion, codex-notion. Ensure ~/.local/bin is on PATH.")
+            install_commands(ROOT, args.bin_dir.expanduser().resolve())
+            print(f"Installed: notion-proxy, claude-notion, codex-notion in {args.bin_dir}. Add that directory to PATH.")
         print("Start manually: notion-proxy" + (" --profile " + args.profile if args.profile != "default" else ""))
         print("No login autostart installed. Existing Claude/Codex settings were not modified.")
     except (ValueError, UpstreamError, OSError, TimeoutError) as exc:

@@ -12,7 +12,7 @@ from .upstream import SESSION_HEADERS
 
 
 def parse_curl(raw):
-    words = shlex.split(raw.replace("\\\r\n", "").replace("\\\n", ""))
+    words = shlex.split(raw.lstrip("\ufeff").replace("\\\r\n", "").replace("\\\n", ""))
     if not words or Path(words.pop(0)).name != "curl":
         raise ValueError("Expected Chrome Copy as cURL (bash) text; the command is parsed, not executed")
     headers, cookies, urls, data = {}, "", [], None

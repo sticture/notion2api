@@ -21,6 +21,11 @@ def private_write(path, text):
 def main():
     claude_path = Path.home() / ".claude/settings.json"
     codex_path = Path.home() / ".codex/config.toml"
+    if not claude_path.exists() or not codex_path.exists():
+        raise SystemExit("This optional router requires existing Claude and Codex settings. "
+                         "For a fresh installation use setup_gateway.py and the claude-notion/codex-notion commands.")
+    if not (LOCAL / "gateway-key").exists():
+        raise SystemExit("Run setup_gateway.py first to verify your Notion login and create the local key")
     claude = json.loads(claude_path.read_text())
     codex = tomlkit.parse(codex_path.read_text())
     backup = LOCAL / "integration-backups" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -36,12 +41,11 @@ def main():
         routes["claude"] = {"base_url": env["ANTHROPIC_BASE_URL"], "auth_token": env["ANTHROPIC_AUTH_TOKEN"]}
     current_provider = codex.get("model_provider", "openai")
     if current_provider != "notion_router":
-        previous = codex["model_providers"][current_provider]
+        previous = codex.get("model_providers", {}).get(current_provider, {})
         if not previous.get("requires_openai_auth"):
             raise SystemExit("This installer expects the existing ChatGPT-authenticated Codex provider")
         routes["codex"] = {"base_url": previous["base_url"]}
     routes["last_backup_dir"] = str(backup)
-    private_write(routes_path, json.dumps(routes))
     key = (LOCAL / "gateway-key").read_text().strip()
     env.update({"ANTHROPIC_BASE_URL": "http://127.0.0.1:8765/claude", "ANTHROPIC_AUTH_TOKEN": key,
                 "ANTHROPIC_CUSTOM_MODEL_OPTION": PICKER, "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Notion Opus 5.5",
@@ -64,6 +68,7 @@ def main():
     else:
         command.symlink_to(ROOT / "scripts/notion_proxy.py")
     (ROOT / "scripts/notion_proxy.py").chmod(0o755)
+    private_write(routes_path, json.dumps(routes))
     private_write(claude_path, json.dumps(claude, ensure_ascii=False, indent=2) + "\n")
     private_write(codex_path, tomlkit.dumps(codex))
     private_write(LOCAL / "integration-installed.json", json.dumps({"backup": str(backup), "command": str(command)}))
