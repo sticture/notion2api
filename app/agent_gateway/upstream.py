@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -49,6 +50,17 @@ class Transcript:
             elif patch.get("op") == "session":
                 self.session = patch.get("session", self.session)
 
+    def partial_text(self):
+        """Text generated so far in the current turn (may be incomplete JSON)."""
+        messages = sorted(
+            (e for e in self.entities.values() if e.get("kind") == "assistant_message"
+             and e.get("sequence", 0) > self.after_sequence
+             and (not self.previous_turn_id or e.get("turn_id") != self.previous_turn_id)),
+            key=lambda e: e.get("sequence", 0),
+        )
+        return "\n".join(block.get("text", "") for message in messages
+                         for block in message.get("content", []) if block.get("type") == "text")
+
     def result(self):
         completed = [e for e in self.entities.values() if e.get("kind") == "turn_completed"
                      and e.get("sequence", 0) > self.after_sequence
@@ -74,14 +86,14 @@ class Transcript:
 
 
 class NotionAgent:
-    def __init__(self, session_file: Path, timeout: float = 180):
+    def __init__(self, session_file: Path, timeout: float | None = None):
         config = json.loads(session_file.read_text())
         # Credential destination is intentionally fixed, not user-overridable.
         if config.get("origin") != "https://app.notion.com":
             raise ValueError("Only https://app.notion.com is supported")
         self.space_id = config["space_id"]
         self.account_scope = hashlib.sha256((config["user_id"] + ":" + self.space_id).encode()).hexdigest()
-        self.timeout = timeout
+        self.timeout = timeout or float(os.getenv("NOTION_GATEWAY_TIMEOUT", "900"))
         headers = {k: v for k, v in config.get("headers", {}).items() if k.lower() in SESSION_HEADERS}
         headers.update({"origin": config["origin"], "referer": config["origin"] + "/chat",
                         "x-notion-space-id": self.space_id,
@@ -138,10 +150,11 @@ class NotionAgent:
                 "browserEnabled": False, "clientMessageId": event_id,
             })
 
-    async def wait_for_turn(self, thread_id, cursor=None, after_sequence=-1, previous_turn_id=None):
+    async def wait_for_turn(self, thread_id, cursor=None, after_sequence=-1, previous_turn_id=None, on_text=None):
         async with asyncio.timeout(self.timeout):
             state = Transcript(after_sequence, previous_turn_id)
             state.cursor = cursor
+            seen = ""
             while True:
                 body = {"spaceId": self.space_id, "threadId": thread_id, "direction": "forward", "limit": 100}
                 if state.cursor:
@@ -151,12 +164,17 @@ class NotionAgent:
                 # Drain all pages before resolving turn completion.
                 if page.get("has_more_forward"):
                     continue
+                if on_text:
+                    partial = state.partial_text()
+                    if partial != seen:
+                        seen = partial
+                        on_text(partial)
                 result = state.result()
                 if result is not None:
                     return result, state.cursor, state.sequence, state.turn_id
                 if state.session.get("pending_input"):
                     raise UpstreamError("Notion requested an internal action; local tool bridging cannot approve it")
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(0.75 if on_text else 1.5)
 
     async def complete(self, prompt: str, effort: str = "medium"):
         """Standalone diagnostic call; client endpoints use the persistent session store."""

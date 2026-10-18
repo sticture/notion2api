@@ -17,14 +17,15 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .protocol import ProtocolError, prepare_request, parse_answer, estimate_tokens, sse, content_events
+from .protocol import (ProtocolError, prepare_request, parse_answer, estimate_tokens, sse, content_events,
+                       answer_options, finalize_answer, leading_text)
 from .upstream import NotionAgent, UpstreamError, PUBLIC_MODEL
 from .responses import PICKER_MODEL, convert_request, convert_answer, response_object, output_events, response_usage
 from .routing import passthrough, HOP_HEADERS
 from .sessions import SessionStore, client_session
 from .config import ROOT, LOCAL, PROFILE, PROFILE_LOCAL, CATALOG
 
-MAX_REQUEST_BYTES = 2_000_000
+MAX_REQUEST_BYTES = int(os.getenv("NOTION_GATEWAY_MAX_REQUEST_BYTES", "16000000"))
 
 
 def error_response(message, status=400):
@@ -125,6 +126,7 @@ async def messages(request: Request):
         if request.url.path.startswith("/claude/") and body.get("model") != PICKER_MODEL:
             return await passthrough(request, bytes(raw), "claude", "v1/messages")
         prompt, tools, choice, effort = prepare_request(body)
+        options = answer_options(body)
     except ProtocolError as exc:
         return error_response(str(exc))
     except (ValueError, TypeError, KeyError, AttributeError):
@@ -134,19 +136,25 @@ async def messages(request: Request):
     message = {"id": message_id, "type": "message", "role": "assistant", "model": body["model"],
                "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage}
     session_key, session_source = client_session(request.headers, body, "messages")
+    if options["stop_sequences"] or options["schema"] is not None:
+        # Side requests (e.g. auto-mode safety classifier) reuse the main session header;
+        # keep them out of the main Notion thread so its history is never resynced.
+        session_key, session_source = uuid.uuid4().hex, "side-request"
 
     def render(text):
         content, stop = parse_answer(text, tools, choice)
-        return {**message, "content": content, "stop_reason": stop,
+        content, stop, stop_sequence = finalize_answer(content, stop, options)
+        return {**message, "content": content, "stop_reason": stop, "stop_sequence": stop_sequence,
                 "usage": {**usage, "output_tokens": estimate_tokens(content)}}
 
-    async def execute():
+    async def execute(progress=None):
         started = time.monotonic()
         audit({"id": message_id, "event": "started", "protocol": "messages", "session_hash": session_key,
                "session_source": session_source})
         try:
             async with app.state.lock:
-                result, info = await app.state.sessions.run(app.state.upstream, session_key, prompt, effort, render)
+                result, info = await app.state.sessions.run(app.state.upstream, session_key, prompt, effort, render,
+                                                            progress)
             result = {**result, "id": message_id}
             audit({"id": message_id, "event": "completed", "model": PUBLIC_MODEL,
                    **info, "session_source": session_source, "duration_s": round(time.monotonic() - started, 2),
@@ -166,18 +174,47 @@ async def messages(request: Request):
             return error_response(str(exc) or "Notion turn timed out", getattr(exc, "status", 502))
 
     async def stream():
-        task = asyncio.create_task(execute())
+        updates = asyncio.Queue()
+        # Emulated stop sequences / schemas rewrite the text, so only stream plain answers live.
+        live = not options["stop_sequences"] and options["schema"] is None
+        task = asyncio.create_task(execute((lambda partial: updates.put_nowait(partial)) if live else None))
+        streamed = ""
         try:
             yield sse("message_start", message=message)
             while not task.done():
-                finished, _ = await asyncio.wait({task}, timeout=5)
-                if not finished:
-                    yield sse("ping")
+                getter = asyncio.ensure_future(updates.get())
+                finished, _ = await asyncio.wait({task, getter}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+                if getter not in finished:
+                    getter.cancel()
+                    if not finished:
+                        yield sse("ping")
+                    continue
+                partial = getter.result()
+                while not updates.empty():
+                    partial = updates.get_nowait()
+                text = leading_text(partial)
+                if len(text) > len(streamed) and text.startswith(streamed):
+                    if not streamed:
+                        yield sse("content_block_start", index=0, content_block={"type": "text", "text": ""})
+                    yield sse("content_block_delta", index=0, delta={"type": "text_delta", "text": text[len(streamed):]})
+                    streamed = text
             result = task.result()
+            content, start = result["content"], 0
+            if streamed:
+                # Only the leading text is streamed early; tool input is still validated before exposure.
+                first = content[0] if content else None
+                if first and first["type"] == "text" and first["text"].startswith(streamed):
+                    if first["text"][len(streamed):]:
+                        yield sse("content_block_delta", index=0,
+                                  delta={"type": "text_delta", "text": first["text"][len(streamed):]})
+                    content = content[1:]
+                yield sse("content_block_stop", index=0)
+                start = 1
             # Buffer and validate the complete JSON before exposing executable tool input.
-            for event in content_events(result["content"]):
+            for event in content_events(content, start):
                 yield event
-            yield sse("message_delta", delta={"stop_reason": result["stop_reason"], "stop_sequence": None},
+            yield sse("message_delta", delta={"stop_reason": result["stop_reason"],
+                                              "stop_sequence": result.get("stop_sequence")},
                       usage=result["usage"])
             yield sse("message_stop")
         except (UpstreamError, ProtocolError, TimeoutError) as exc:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import uuid
 
 from jsonschema import Draft202012Validator, SchemaError
@@ -9,7 +11,8 @@ from referencing import Registry
 
 from .upstream import PUBLIC_MODEL
 
-MAX_INPUT_CHARS = 180_000
+# Full client context bound; the per-turn upstream payload is bounded separately in sessions.py.
+MAX_INPUT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_INPUT_CHARS", "4000000"))
 ALIASES = {PUBLIC_MODEL, "claude-opus5.5", "notion-opus-5.5", "notion-claude-opus-5-5"}
 
 
@@ -37,9 +40,59 @@ def normalize_content(content, role):
             result.append({"type": kind, "tool_use_id": block["tool_use_id"],
                            "content": normalize_content(block.get("content", ""), "tool_result"),
                            "is_error": bool(block.get("is_error", False))})
+        elif kind in {"thinking", "redacted_thinking"} and role == "assistant":
+            # Thinking from another provider cannot be replayed to Notion; drop it.
+            continue
         else:
             raise ProtocolError(f"Unsupported content block {kind!r}; this gateway supports text and local tools only")
     return result
+
+
+def answer_options(body: dict):
+    """Emulated stop sequences and JSON-schema output (used by Claude Code side requests)."""
+    stops = body.get("stop_sequences") or []
+    if not isinstance(stops, list) or len(stops) > 8 or not all(isinstance(s, str) and s for s in stops):
+        raise ProtocolError("stop_sequences must be a list of up to 8 non-empty strings")
+    fmt = (body.get("output_config") or {}).get("format") or body.get("output_format")
+    schema = None
+    if fmt:
+        if not isinstance(fmt, dict) or fmt.get("type") != "json_schema" or not isinstance(fmt.get("schema"), dict):
+            raise ProtocolError("Only json_schema output format is supported")
+        try:
+            Draft202012Validator.check_schema(fmt["schema"])
+        except SchemaError:
+            raise ProtocolError("Invalid output JSON schema") from None
+        schema = fmt["schema"]
+    return {"stop_sequences": stops, "schema": schema}
+
+
+def finalize_answer(content: list, stop: str, options: dict):
+    """Apply emulated stop sequences / output schema. Returns (content, stop_reason, stop_sequence)."""
+    if options["schema"] is not None:
+        texts = [b for b in content if b["type"] == "text"]
+        if stop == "tool_use" or len(texts) != 1:
+            raise ProtocolError("Structured output requires exactly one text block")
+        raw = texts[0]["text"].strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            value = json.loads(raw)
+            Draft202012Validator(options["schema"], registry=Registry()).validate(value)
+        except Exception:
+            raise ProtocolError("Structured output does not match the requested schema") from None
+        return [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "end_turn", None
+    if options["stop_sequences"] and stop != "tool_use":
+        output = []
+        for block in content:
+            text = block["text"]
+            hits = [(text.find(s), s) for s in options["stop_sequences"] if s in text]
+            if hits:
+                index, seq = min(hits)
+                if text[:index]:
+                    output.append({"type": "text", "text": text[:index]})
+                return output or [{"type": "text", "text": ""}], "stop_sequence", seq
+            output.append(block)
+    return content, stop, None
 
 
 def prepare_request(body: dict):
@@ -47,9 +100,8 @@ def prepare_request(body: dict):
         raise ProtocolError("Only claude-opus-5-5 is supported; no silent model fallback")
     if not isinstance(body.get("max_tokens"), int) or body["max_tokens"] < 1:
         raise ProtocolError("max_tokens must be a positive integer")
-    if body.get("stop_sequences") or body.get("output_config", {}).get("format"):
-        raise ProtocolError("Custom stop sequences and native structured output are not supported")
-    effort = body.get("output_config", {}).get("effort", "medium")
+    options = answer_options(body)
+    effort = (body.get("output_config") or {}).get("effort", "medium")
     if effort not in {"low", "medium", "high", "xhigh", "max"}:
         raise ProtocolError("Unsupported reasoning effort")
     tools = {}
@@ -91,6 +143,14 @@ def prepare_request(body: dict):
     context = {"system": normalize_content(body.get("system", ""), "system"),
                "tools": list(tools.values()), "tool_choice": choice,
                "messages": messages, "max_output_tokens": body["max_tokens"]}
+    if options["stop_sequences"]:
+        context["stop_sequences"] = options["stop_sequences"]
+        context["stop_sequences_rule"] = ("If your text would contain one of stop_sequences, end the text "
+                                           "right after that sequence and add nothing more.")
+    if options["schema"] is not None:
+        context["output_json_schema"] = options["schema"]
+        context["output_json_schema_rule"] = ("Do not call tools. Return exactly one text block whose text is "
+                                               "a JSON value (no Markdown) that validates against output_json_schema.")
     prompt = (
         "You are assisting a local coding client through a JSON protocol bridge. "
         "The client's filesystem and terminal tools execute on the user's computer, outside Notion. "
@@ -153,6 +213,33 @@ def parse_answer(text: str, tools: dict, choice: dict):
     return output, "tool_use" if calls else "end_turn"
 
 
+_TEXT_HEAD = re.compile(r'\s*(?:```json\s*)?\{\s*"content"\s*:\s*\[\s*\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"')
+
+
+def leading_text(partial: str) -> str:
+    """Decoded prefix of the first text block of a partial JSON envelope, for live text streaming."""
+    match = _TEXT_HEAD.match(partial)
+    if not match:
+        return ""
+    raw, i = partial[match.end():], 0
+    while i < len(raw):
+        if raw[i] == "\\":
+            step = 6 if raw[i + 1:i + 2] == "u" else 2
+            if i + step > len(raw):
+                break
+            i += step
+        elif raw[i] == '"':
+            break
+        else:
+            i += 1
+    try:
+        text = json.loads('"' + raw[:i] + '"', strict=False)
+    except ValueError:
+        return ""
+    # A lone high surrogate means the pair is still incomplete.
+    return text[:-1] if text and "\ud800" <= text[-1] <= "\udbff" else text
+
+
 def estimate_tokens(value):
     # This is an estimate, never reported as Notion's billed usage or cache usage.
     return max(1, math.ceil(len(json.dumps(value, ensure_ascii=False)) / 4))
@@ -162,8 +249,8 @@ def sse(event, **data):
     return "event: " + event + "\ndata: " + json.dumps({"type": event, **data}, ensure_ascii=False) + "\n\n"
 
 
-def content_events(content):
-    for index, block in enumerate(content):
+def content_events(content, start=0):
+    for index, block in enumerate(content, start):
         if block["type"] == "text":
             yield sse("content_block_start", index=index, content_block={"type": "text", "text": ""})
             yield sse("content_block_delta", index=index, delta={"type": "text_delta", "text": block["text"]})

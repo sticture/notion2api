@@ -17,6 +17,8 @@ from pathlib import Path
 from .upstream import UpstreamError
 
 MARKER = "CLIENT_CONTEXT_JSON:\n"
+# Bound on what is actually sent per turn (append mode sends only new messages).
+MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_SEND_CHARS", "400000"))
 
 
 def digest(value):
@@ -72,6 +74,60 @@ def context_parts(prompt):
     return preamble, context, atoms
 
 
+def group(atoms):
+    messages = []
+    for atom in atoms:
+        if messages and messages[-1]["role"] == atom["role"]:
+            messages[-1]["content"].append(atom["content"])
+        else:
+            messages.append({"role": atom["role"], "content": [atom["content"]]})
+    return messages
+
+
+def size(value):
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def clip(atom, limit):
+    """Shorten oversized text inside one atom (e.g. a huge tool result), keeping head and tail."""
+    def cut(block):
+        if block.get("type") == "text" and len(block.get("text", "")) > limit:
+            text, half = block["text"], limit // 2
+            return {**block, "text": text[:half] + f"\n...[{len(text) - limit} chars omitted by bridge]...\n" + text[-half:]}
+        if block.get("type") == "tool_result":
+            return {**block, "content": [cut(b) for b in block.get("content", [])]}
+        return block
+    return {**atom, "content": cut(atom["content"])}
+
+
+def fit_atoms(atoms, budget, allow_drop):
+    """Fit history into budget chars. Returns (atoms, omitted_count); the input list is returned unchanged if it fits."""
+    budget = max(budget, 20000)
+    sizes = [size(a) for a in atoms]
+    if sum(sizes) <= budget:
+        return atoms, 0
+    limit = max(budget // 8, 8000)
+    atoms = [clip(a, limit) if s > limit else a for a, s in zip(atoms, sizes)]
+    sizes = [size(a) for a in atoms]
+    if not allow_drop or sum(sizes) <= budget:
+        return atoms, 0
+    # Only cut at user input with no later tool_result whose tool_use would be dropped.
+    cuts, unmatched = [], set()
+    suffix = [0] * (len(atoms) + 1)
+    for i in range(len(atoms) - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + sizes[i]
+        block = atoms[i]["content"]
+        if block.get("type") == "tool_result":
+            unmatched.add(block.get("tool_use_id"))
+        elif block.get("type") == "tool_use":
+            unmatched.discard(block.get("id"))
+        elif atoms[i]["role"] == "user" and not unmatched:
+            cuts.append(i)
+    cuts.reverse()
+    choice = next((i for i in cuts if suffix[i] <= budget), cuts[-1] if cuts else 0)
+    return atoms[choice:], choice
+
+
 def incremental_prompt(prompt, record):
     preamble, settings, atoms = context_parts(prompt)
     hashes = [digest(atom) for atom in atoms]
@@ -82,16 +138,22 @@ def incremental_prompt(prompt, record):
     history = previous.get("history", [])
     append = bool(previous) and hashes[:len(history)] == history
     start = len(history) if append else 0
-    messages = []
-    for atom in atoms[start:]:
-        if messages and messages[-1]["role"] == atom["role"]:
-            messages[-1]["content"].append(atom["content"])
-        else:
-            messages.append({"role": atom["role"], "content": [atom["content"]]})
+    messages = group(atoms[start:])
     mode = "initial" if not record else "append" if append else "resync"
     changes = {k: v for k, v in settings.items()
                if not append or previous.get("settings", {}).get(k) != setting_hashes[k]}
     payload = {"mode": mode, **changes, "messages": messages}
+    base = len(json.dumps({**payload, "messages": []}, ensure_ascii=False, separators=(",", ":")))
+    budget = MAX_SEND_CHARS - len(preamble) - base - 4000
+    pending_atoms = atoms[start:]
+    kept, omitted = fit_atoms(pending_atoms, budget, allow_drop=not append)
+    if kept is not pending_atoms:
+        messages = group(kept)
+        payload = {"mode": mode, **changes, "messages": messages}
+        if omitted:
+            payload["omitted_earlier_items"] = omitted
+            payload["omitted_note"] = ("The oldest client history items were omitted to fit the bridge's "
+                                       "size limit; rely on the remaining history and message_system.")
     instructions = (
         "This is a persistent local-client conversation. In append mode, add only the supplied messages "
         "to the existing client history and keep unchanged context fields. Assistant messages acknowledge "
@@ -134,7 +196,7 @@ class SessionStore:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?)", (self.storage_key(key), json.dumps(record)))
 
-    async def run(self, upstream, key, prompt, effort, render):
+    async def run(self, upstream, key, prompt, effort, render, progress=None):
         record = self.get(key)
         sent, snapshot, fingerprint, mode = incremental_prompt(prompt, record)
         fingerprint = digest([fingerprint, effort])
@@ -152,6 +214,10 @@ class SessionStore:
             sent, snapshot, _, mode = incremental_prompt(prompt, record)
             pending = None
         if not pending:
+            if len(sent) > MAX_SEND_CHARS:
+                # Nothing has been saved or dispatched yet, so the existing binding is untouched.
+                raise UpstreamError(f"Turn payload {len(sent)} chars exceeds {MAX_SEND_CHARS}; "
+                                    "compact the conversation", 413, rejected=True)
             continuation = bool(record)
             record = record or {"thread_id": str(uuid.uuid4()), "effort": effort}
             pending = {"fingerprint": fingerprint, "snapshot": snapshot, "mode": mode,
@@ -174,7 +240,8 @@ class SessionStore:
                 raise
         if "answer" not in pending:
             text, cursor, sequence, turn_id = await upstream.wait_for_turn(
-                record["thread_id"], record.get("cursor"), record.get("sequence", -1), record.get("turn_id"))
+                record["thread_id"], record.get("cursor"), record.get("sequence", -1), record.get("turn_id"),
+                on_text=progress)
             pending.update(answer=text, cursor=cursor, sequence=sequence, turn_id=turn_id)
             self.save(key, record)
         # Keep raw answers private until schema validation succeeds. Retry the same
