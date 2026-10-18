@@ -1,5 +1,9 @@
 # Notion2API
 
+> 本地开发分支新增：[Notion Opus 5.5 本地编程代理](docs/LOCAL_CODING_GATEWAY.md)。运行 `notion-proxy` 后，照常打开 Claude Code / Codex，在模型列表选择 **Notion Opus 5.5**。提供 Messages 与 Responses 接口；原有模型继续走原服务。未设置登录自启。
+
+> 会话连续性已修复：同一个 Claude Code / Codex 对话持续复用同一个 Notion 会话，工具调用和代理重启后也会保留绑定。续轮增量发送消息；新建客户端对话才建立独立绑定。
+
 > Notion AI → OpenAI 兼容 API
 
 🌐 [English](./README_EG.md) | 中文

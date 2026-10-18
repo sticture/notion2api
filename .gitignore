@@ -69,3 +69,10 @@ docker-compose.override.yml
 
 # Response debug data (contains sensitive tokens)
 response/
+
+# Local gateway credentials, acceptance logs, scratch files
+.local/
+work/
+task_plan.md
+findings.md
+progress.md

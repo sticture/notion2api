@@ -7,3 +7,5 @@ pydantic
 slowapi
 httpx
 websocket-client
+jsonschema
+tomlkit

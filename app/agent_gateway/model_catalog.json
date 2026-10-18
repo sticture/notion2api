@@ -1,0 +1,63 @@
+{
+  "models": [
+    {
+      "slug": "notion-claude-opus-5-5",
+      "display_name": "Notion Opus 5.5",
+      "description": "Local coding through Notion AI; external plugin tools are unavailable on this model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "low"
+        },
+        {
+          "effort": "medium",
+          "description": "medium"
+        },
+        {
+          "effort": "high",
+          "description": "high"
+        },
+        {
+          "effort": "xhigh",
+          "description": "xhigh"
+        },
+        {
+          "effort": "max",
+          "description": "max"
+        }
+      ],
+      "shell_type": "unified_exec",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 20,
+      "additional_speed_tiers": [],
+      "service_tiers": [],
+      "include_skills_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "include_apps_usage_instructions": false,
+      "default_reasoning_summary": "none",
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text_and_image",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_image_detail_original": false,
+      "context_window": 128000,
+      "max_context_window": 128000,
+      "effective_context_window_percent": 90,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text"
+      ],
+      "supports_search_tool": false,
+      "supports_experimental_context": false,
+      "use_responses_lite": false,
+      "supports_reasoning_effort_updates": false,
+      "base_instructions": "You are a coding assistant working in the user local repository. Inspect files using the available tools, make focused edits, run relevant tests, and report concrete results. Use tools instead of inventing file contents or command output."
+    }
+  ]
+}
