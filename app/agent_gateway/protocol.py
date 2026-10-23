@@ -13,7 +13,7 @@ from .upstream import PUBLIC_MODEL
 from .media import ImageError, ImagePrompt, normalize_image
 
 # Full client context bound; the per-turn upstream payload is bounded separately in sessions.py.
-MAX_INPUT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_INPUT_CHARS", "4000000"))
+MAX_INPUT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_INPUT_CHARS", "8000000"))
 # Client tool descriptions are long usage guides; schemas stay exact and are still validated.
 TOOL_DESC_CHARS = int(os.getenv("NOTION_GATEWAY_TOOL_DESC_CHARS", "1200"))
 

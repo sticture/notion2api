@@ -17,6 +17,8 @@ from .media import FilePrompt, IMAGE_EXTENSIONS
 
 MODEL = "albuquerque-quinn"
 PUBLIC_MODEL = "claude-opus-5-5"
+PRIMARY_ORIGIN = "https://app.notion.com"
+COMPAT_ORIGIN = "https://www.notion.so"
 SESSION_HEADERS = {"user-agent", "notion-client-version", "notion-audit-log-platform",
                    "x-notion-cell-hint", "x-notion-cell-hint-source"}
 
@@ -51,6 +53,25 @@ def retry_after_seconds(response):
     except ValueError:
         return None
     return value if 0 < value <= 86400 else None
+
+
+def edge_blocked(response):
+    """An HTML edge rejection is not a Notion account/permission decision."""
+    return (response.status_code == 403
+            and "html" in response.headers.get("content-type", "").lower()
+            and (response.headers.get("server", "").lower() == "cloudflare"
+                 or "cloudflare" in response.text[:8000].lower()))
+
+
+def edge_error(endpoint, retry_after=30):
+    error = UpstreamError(
+        "Notion's network protection temporarily blocked the upstream connection (HTTP 403). "
+        "Retry shortly; signing in to Claude again will not resolve this network error.",
+        503, rejected=endpoint in {"createAgentThread", "sendEventToAgentThread"},
+        retry_after=retry_after)
+    error.diagnostics = {"error_code": "upstream_edge_blocked", "upstream_endpoint": endpoint,
+                         "upstream_status": 403, "stage": "edge"}
+    return error
 
 
 class Transcript:
@@ -135,9 +156,10 @@ class Transcript:
 class NotionAgent:
     def __init__(self, session_file: Path, timeout: float | None = None):
         config = json.loads(session_file.read_text())
-        # Credential destination is intentionally fixed, not user-overridable.
-        if config.get("origin") != "https://app.notion.com":
+        # Destinations are fixed official Notion origins, never request-controlled.
+        if config.get("origin") != PRIMARY_ORIGIN:
             raise ValueError("Only https://app.notion.com is supported")
+        self.api_origin = PRIMARY_ORIGIN
         self.space_id = config["space_id"]
         self.account_scope = hashlib.sha256((config["user_id"] + ":" + self.space_id).encode()).hexdigest()
         self.timeout = timeout or float(os.getenv("NOTION_GATEWAY_TIMEOUT", "300"))
@@ -160,10 +182,24 @@ class NotionAgent:
     async def post(self, endpoint: str, body: dict):
         # Read-only requests are safe to retry. Writes require session-level
         # reconciliation; never replay a generation POST because its response broke.
+        remaining = getattr(self, "edge_blocked_until", 0) - time.monotonic()
+        if remaining > 0:
+            raise edge_error(endpoint, remaining)
         attempts = 3 if endpoint in {"getThreadTranscript", "getAvailableModels", "getCreditRateLimitStatus"} else 1
+        origin = getattr(self, "api_origin", PRIMARY_ORIGIN)
         for attempt in range(attempts):
             try:
-                response = await self.client.post("/api/v3/" + endpoint, json=body)
+                headers = {"origin": origin, "referer": origin + "/chat"}
+                response = await self.client.post(origin + "/api/v3/" + endpoint, json=body, headers=headers)
+                if edge_blocked(response) and origin == PRIMARY_ORIGIN:
+                    # The edge explicitly rejected this request before Notion
+                    # accepted it. Only then may we retry the identical event on
+                    # Notion's other fixed official API origin; no redirects.
+                    origin = COMPAT_ORIGIN
+                    response = await self.client.post(origin + "/api/v3/" + endpoint, json=body,
+                        headers={"origin": origin, "referer": origin + "/chat"})
+                if response.status_code == 200:
+                    self.api_origin = origin
             except httpx.HTTPError as exc:
                 if attempt + 1 < attempts:
                     await asyncio.sleep(0.5 * (2 ** attempt))
@@ -172,6 +208,11 @@ class NotionAgent:
                 error.diagnostics = {"upstream_endpoint": endpoint, "transport_error": type(exc).__name__,
                                      "read_attempts": attempt + 1}
                 raise error from None
+            if edge_blocked(response):
+                # Do not hammer an edge block or label valid gateway credentials
+                # as rejected. A definitive edge rejection did not start a turn.
+                self.edge_blocked_until = time.monotonic() + 30
+                raise edge_error(endpoint)
             if response.status_code in {408, 500, 502, 503, 504} and attempt + 1 < attempts:
                 await asyncio.sleep(0.5 * (2 ** attempt))
                 continue

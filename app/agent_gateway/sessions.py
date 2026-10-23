@@ -22,7 +22,7 @@ from .media import ImagePrompt, MAX_TURN_IMAGES, images_in_messages
 MARKER = "CLIENT_CONTEXT_JSON:\n"
 # UTF-8 byte bound on actual serialized content, including JSON escaping. Notion
 # persists multiple copies; a ~200 KB request can exceed its DynamoDB item limit.
-MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_SEND_CHARS", "180000"))
+MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_SEND_CHARS", "195000"))
 MAX_TOOL_RESULT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_TOOL_RESULT_CHARS", "16000"))
 # Notion re-reads the whole thread every turn, so cost grows with thread length.
 # Optional (0 = off; Notion manages its own thread context): past this many accumulated
@@ -32,10 +32,10 @@ ROLLOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_ROLLOVER_SEED_CHARS", "80000
 # Optional tighter bound for stateless side requests (0 = same as MAX_SEND_CHARS).
 SIDE_MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_SIDE_MAX_SEND_CHARS", "0"))
 # Recent history replayed onto the new workspace's thread on failover (keeps usage bounded).
-FAILOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_FAILOVER_SEED_CHARS", "60000"))
+FAILOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_FAILOVER_SEED_CHARS", "195000"))
 # Hard cap on the first turn of every fresh Notion thread (initial, resync, side request, failover).
 # Notion bills the whole input of that turn, so big replays drain usage fast.
-NEW_THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_NEW_THREAD_MAX_CHARS", "60000"))
+NEW_THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_NEW_THREAD_MAX_CHARS", "195000"))
 MAX_ANSWER_REPAIRS = 2
 
 
@@ -234,20 +234,27 @@ def shorten_middle(text, limit):
     return text[:half] + marker + text[-half:] if half else marker
 
 
-def fit_atoms(atoms, limit):
+def fit_atoms(atoms, limit, preserve_user=False):
     """Shrink the largest text items (keeping head and tail) until the history fits limit."""
     atoms, shortened = list(atoms), 0
+    minimum = 512 if preserve_user else 2000
     for _ in range(2 * len(atoms)):
         sizes = [size(a) for a in atoms]
         excess = sum(sizes) - limit
         if excess <= 0 or not atoms:
             break
-        i = max(range(len(atoms)), key=sizes.__getitem__)
-        text = atom_text(atoms[i])
-        if text is None or len(text) < 4000:
+        # Tool arguments stay exact. A large immutable invocation must not stop
+        # us from shortening the surrounding historical tool output instead.
+        candidates = [i for i, atom in enumerate(atoms)
+                      if (text := atom_text(atom)) is not None and len(text) >= 2 * minimum
+                      and (not preserve_user or atom["role"] == "assistant"
+                           or atom["content"]["type"] == "tool_result")]
+        if not candidates:
             break
+        i = max(candidates, key=sizes.__getitem__)
+        text = atom_text(atoms[i])
         ratio = len(text) / max(sizes[i], 1)
-        target = max(2000, int(len(text) - excess * ratio) - 500)
+        target = max(minimum, int(len(text) - excess * ratio) - 500)
         atoms[i] = with_text(atoms[i], shorten_middle(text, target))
         shortened += 1
     return atoms, shortened
@@ -348,6 +355,11 @@ def incremental_prompt(prompt, record, budget=None):
             # MAX_SEND_CHARS is rejected explicitly below instead of being hidden.
             usage_cap = min(budget or NEW_THREAD_MAX_CHARS, NEW_THREAD_MAX_CHARS)
             kept, shortened = fit_atoms(kept, max(0, usage_cap - overhead))
+            truncated += shortened
+        if not record:
+            # A generous seed/usage budget cannot bypass the wire cap. Preserve
+            # user instructions and tool arguments while bounding replayed output.
+            kept, shortened = fit_atoms(kept, max(0, cap - overhead), preserve_user=True)
             truncated += shortened
     payload = {"mode": mode, **changes, "messages": group(kept)}
     selected_images = images_in_messages(payload["messages"], images) if images else {}
@@ -555,8 +567,13 @@ class SessionStore:
                 sent = await upstream.prepare_images(sent, record["thread_id"], continuation)
             if wire_size(sent) > MAX_SEND_CHARS:
                 # Nothing has been saved or dispatched yet, so the existing binding is untouched.
-                raise UpstreamError(f"Turn payload {wire_size(sent)} UTF-8 bytes exceeds {MAX_SEND_CHARS}; "
-                                    "compact the conversation", 413, rejected=True)
+                error = UpstreamError(
+                    f"Turn payload {wire_size(sent)} UTF-8 bytes exceeds {MAX_SEND_CHARS}; "
+                    "compact the conversation", 413, rejected=True)
+                error.diagnostics = {"error_code": "context_payload_too_large", "stage": "prepare",
+                                     "history_mode": mode, "input_bytes": wire_size(sent),
+                                     "limit_bytes": MAX_SEND_CHARS}
+                raise error
             pending = {"fingerprint": fingerprint, "snapshot": snapshot, "mode": mode,
                        "input_chars": len(sent), "input_bytes": wire_size(sent),
                        "event_id": retry_event_id or str(uuid.uuid4()),

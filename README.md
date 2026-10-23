@@ -159,9 +159,9 @@ notion-proxy
 
 ### 新 thread 首轮输入上限
 
-每次新建 Notion thread（首次绑定、独立辅助请求、切换 workspace）时，首轮输入预算默认 60000 个 JSON 转义后的 UTF-8 字节（`NOTION_GATEWAY_NEW_THREAD_MAX_CHARS`），同时受 `NOTION_GATEWAY_MAX_SEND_CHARS` 的单次发送保护限制。预算包含系统提示和工具定义。超出时先丢最早的完整历史轮次；单条文本超过首轮用量预算时保留头尾，若仍超过发送保护上限则返回 413。之后的轮次照常只发增量。
+每次新建 Notion thread（首次绑定、独立辅助请求、切换 workspace）时，首轮输入预算默认 195000 个 JSON 转义后的 UTF-8 字节（`NOTION_GATEWAY_NEW_THREAD_MAX_CHARS`，备用 workspace 的 `NOTION_GATEWAY_FAILOVER_SEED_CHARS` 默认相同），同时受 `NOTION_GATEWAY_MAX_SEND_CHARS` 的单次发送保护限制。预算包含系统提示和工具定义。超出时先丢最早的完整历史轮次；单条文本超过首轮用量预算时保留头尾。长轮次仍超限时继续压缩历史工具输出并明确标注，保留用户指令和工具参数；不可压缩的内容仍超限则返回 413。之后的轮次照常只发增量。
 
-同一客户端会话默认一直复用原 Notion thread，`NOTION_GATEWAY_THREAD_MAX_CHARS=0` 表示不因累计长度换线程，累计历史可以超过 300K；这不代表 Notion 模型保证保留全部历史。将新线程预算设为 `300000` 也不会绕过默认 `180000` 字节的单次发送保护。Notion 新建线程时会多次保存输入，直接提高发送保护可能触发其 409600 字节的内部写入限制。
+同一客户端会话默认一直复用原 Notion thread，`NOTION_GATEWAY_THREAD_MAX_CHARS=0` 表示不因累计长度换线程，累计历史可以超过 300K；这不代表 Notion 模型保证保留全部历史。将新线程预算设为 `300000` 也不会绕过默认 `195000` 字节的单次发送保护。Notion 新建线程时会多次保存输入，直接提高发送保护可能触发其 409600 字节的内部写入限制。
 
 历史压缩或编辑在原 thread 上重同步，不受较小的首轮预算限制。Claude Code 的离开后自动回顾也复用原 thread，但单独缓存响应，不覆盖主对话的历史快照，避免下一句用户消息触发不必要的全量重同步。
 
@@ -240,9 +240,10 @@ macOS/Linux 不使用全局命令时，也可通过仓库 `.venv/bin/python` 和
 | `Profile is not configured` | 先运行 `setup_gateway.py --from-curl ...` |
 | `missing token_v2` 或账号/workspace 缺失 | 复制已登录的实际请求，包含 Cookie 和必要请求头；不要手工删字段 |
 | `Opus 5.5 is not enabled` | 当前 workspace 没有可用权限，先在网页确认；代理不会绕过权限或自动买席位 |
-| HTTP 401 / 403 | 检查登录是否失效、是否导入了正确账号和 workspace |
+| HTTP 401 / 403（Notion JSON） | 检查登录是否失效、是否导入了正确账号和 workspace |
+| Desktop 提示认证失败，但上游是 Cloudflare 403 HTML | 网关只在明确边缘拦截时自动重试固定的 Notion 官方 `www.notion.so` API；成功后复用该入口，不改变账号、Workspace 或 Thread。两个官方入口均被拦时返回 503 并退避，不要求重新登录，也不会因此切换 Workspace |
 | `Could not stop previous Notion proxy` | 旧网关进程关不掉（例如属于其他用户），手动 `kill` 后重试 |
-| `createAgentThread` 400 / 超长上下文 413 | 18 万字节预算只检查提取增量后、JSON 转义后的 UTF-8 内容；中文和反斜杠也按实际大小计入。完整客户端历史可达 400 万字符（HTTP 请求另限 128 MB）。首次导入/重同步会按完整用户轮次移除最旧历史并告知模型；单轮仍超限时需压缩或分批 |
+| `createAgentThread` 400 / 超长上下文 413 | 19.5 万字节预算只检查提取增量后、JSON 转义后的 UTF-8 内容；中文和反斜杠也按实际大小计入。完整客户端历史可达 800 万字符（HTTP 请求另限 128 MB）。首次导入/重同步会按完整用户轮次移除最旧历史并告知模型；新 Thread 导入仍超限时压缩历史输出，不改工具参数。不可压缩的单轮输入仍需分批 |
 | 回复看起来停顿 | SSE 会保持心跳，但 JSON 工具结果要完整生成并校验后才能发送 |
 | 偶尔又新建了一个 Notion 聊天 | 主对话续轮、失败恢复和历史重同步均复用；新客户端会话、独立辅助请求、明确额度耗尽后的 workspace 切换，以及显式启用的长度轮换仍可能新建 |
 | 只在浏览器看到 JSON，项目没变化 | 不算编程成功；检查客户端是否真的执行 Read/Edit/Bash 或 exec_command/apply_patch，并查看测试结果 |
@@ -251,9 +252,9 @@ macOS/Linux 不使用全局命令时，也可通过仓库 `.venv/bin/python` 和
 
 `.local/` 已被 Git 忽略，包含登录 Cookie、本机 API key、会话数据库、响应缓存和诊断日志。它们不是可分享的安装文件。默认 profile 在 `.local/`；命名 profile 在 `.local/profiles/<name>/`。不要把这些内容提交到 GitHub，即使仓库是私有的。
 
-代码、提示词及工具结果会通过你的账号发送到 Notion 并生成聊天记录。Notion Cookie 只用于 `https://app.notion.com`，不交给 Claude Code 或 Codex。代理不会直接执行本地工具；输入和输出 token 数只是估算，并非官方计费数据。
+代码、提示词及工具结果会通过你的账号发送到 Notion 并生成聊天记录。Notion Cookie 只用于固定的 Notion 官方 `https://app.notion.com` 和 `https://www.notion.so` API，不跟随重定向，不交给 Claude Code 或 Codex。代理不会直接执行本地工具；输入和输出 token 数只是估算，并非官方计费数据。
 
-普通续聊只发送新增消息与有变化的设置，不重复发送完整历史、上一轮助手正文、代码补丁或未变化的工具定义。工具结果通过简短 ID 对照关联原调用。已知的客户端计费追踪头和剩余 token 计数不会触发系统提示重发。单条超长工具结果默认保留头尾共约 16,000 字符，并标注截断、提示按范围重读；用户指令和代码编辑参数不自动截断。首次导入或历史重同步超过实际发送预算时，会按完整用户轮次移除最旧历史，并在传给模型的上下文中标注；最近一轮仍放不下时返回 413。为兼容旧配置，`NOTION_GATEWAY_MAX_SEND_CHARS` 名称保留，但其值现在表示 JSON 转义后的 UTF-8 字节预算（默认 180000），不是字符数。普通续轮不会为满足预算删除新增指令。
+普通续聊只发送新增消息与有变化的设置，不重复发送完整历史、上一轮助手正文、代码补丁或未变化的工具定义。工具结果通过简短 ID 对照关联原调用。已知的客户端计费追踪头和剩余 token 计数不会触发系统提示重发。单条超长工具结果默认保留头尾共约 16,000 字符，并标注截断、提示按范围重读；用户指令和代码编辑参数不自动截断。首次导入或历史重同步超过实际发送预算时，会按完整用户轮次移除最旧历史，并在传给模型的上下文中标注；新 Thread 的历史输出还会按实际发送预算压缩，不会因最大的条目是工具参数而中止压缩。不可压缩的输入仍超限则返回 413。为兼容旧配置，`NOTION_GATEWAY_MAX_SEND_CHARS` 名称保留，但其值现在表示 JSON 转义后的 UTF-8 字节预算（默认 195000），不是字符数。普通续轮不会为满足预算删除新增指令。
 
 这些优化减少代理重复上传的数据，不能据此推算 Notion 的额度消耗或计费：Notion 仍管理其远端会话历史，具体缓存和计量方式不由代理控制。审计日志中的 `client_input_chars` / `upstream_input_chars` 用于区分完整客户端输入和本轮实际发送量；客户端 token usage 不是官方账单。
 
