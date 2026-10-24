@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .media import FilePrompt, IMAGE_EXTENSIONS
+from .network import NotionTransport
 
 MODEL = "albuquerque-quinn"
 PUBLIC_MODEL = "claude-opus-5-5"
@@ -174,6 +175,7 @@ class NotionAgent:
             base_url=config["origin"], headers=headers,
             cookies={c["name"]: c["value"] for c in config["cookies"]},
             timeout=httpx.Timeout(40, connect=15), follow_redirects=False,
+            transport=NotionTransport(),
         )
 
     async def close(self):
@@ -312,7 +314,8 @@ class NotionAgent:
                 raise ValueError("file id")
             parts = None
             # Storage must never receive Notion cookies or incoming client credentials.
-            async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15), follow_redirects=False) as storage:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15), follow_redirects=False,
+                                         transport=NotionTransport()) as storage:
                 if upload["type"] == "single_part":
                     await self.upload_part(storage, upload, image.data)
                 elif upload["type"] == "multi_part":
